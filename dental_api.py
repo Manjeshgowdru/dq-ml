@@ -26,7 +26,6 @@ def predict(appointment: dict):
             "Handcap":        appointment["handcap"]
         }])
 
-        # prob = model.predict_proba(features)[0][1]
         prob = float(model.predict_proba(features)[0][1])
 
         if prob >= 0.55:
