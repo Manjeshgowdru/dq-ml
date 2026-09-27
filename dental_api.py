@@ -1,17 +1,36 @@
 import os
-from datetime import datetime, timedelta
-import joblib
-import pandas as pd
-import pytz
-from fastapi import FastAPI, HTTPException
+import json
+import re
+from datetime import datetime, date, time, timedelta
+from typing import Optional, List
+
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from pydantic import BaseModel
+from googleapiclient.errors import HttpError
 
-app = FastAPI(title="DentalIQ & Calendar Engine")
+# ==========================================
+# CONFIGURATION & CONSTANTS
+# ==========================================
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "service_account.json")
+CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+TIMEZONE = os.environ.get("CLINIC_TIMEZONE", "Europe/Bratislava")
 
-# Enable CORS for frontend requests
+CLINIC_OPEN_HOUR = 8       # 08:00
+CLINIC_CLOSE_HOUR = 17     # 17:00
+SLOT_DURATION_MINUTES = 30 # 30 min per slot
+
+app = FastAPI(
+    title="DentalIQ Intelligent Revenue & Calendar Engine",
+    description="Backend API powering DentalIQ scheduling, no-show protection, and calendar synchronization.",
+    version="1.0.0"
+)
+
+# Enable CORS for local dev and cloud frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,260 +39,368 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------
-# 1. Optional ML Model Setup
-# -------------------------------------------------------------
-model = None
-if os.path.exists("dental_model.pkl"):
-    try:
-        model = joblib.load("dental_model.pkl")
-    except Exception as e:
-        print(f"Warning: Could not load dental_model.pkl: {e}")
 
-# -------------------------------------------------------------
-# 2. Calendar Configuration (Environment or Defaults)
-# -------------------------------------------------------------
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Bratislava")
-
-# Clinic calendar target email
-CLINIC_CALENDAR_ID = os.getenv("CLINIC_CALENDAR_ID", "gowdrislabs@gmail.com")
-
-CLINIC_OPEN_HOUR = int(os.getenv("CLINIC_OPEN_HOUR", "8"))
-CLINIC_CLOSE_HOUR = int(os.getenv("CLINIC_CLOSE_HOUR", "17"))
-SLOT_DURATION_MINS = 30
-
-
+# ==========================================
+# AUTHENTICATION & GOOGLE CLIENT
+# ==========================================
 def get_calendar_service():
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        raise FileNotFoundError(f"Missing {SERVICE_ACCOUNT_FILE} in project root.")
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    """
+    Initializes and returns an authorized Google Calendar service instance.
+    Checks cloud environment variables first, falling back to local file.
+    """
+    # 1. Cloud deployment: check for raw JSON credentials in environment variables
+    env_creds = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if env_creds:
+        try:
+            creds_info = json.loads(env_creds)
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info, scopes=SCOPES
+            )
+            return build("calendar", "v3", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            print("Error parsing GOOGLE_SERVICE_ACCOUNT_JSON:", e)
+
+    # 2. Local development fallback: load from service_account.json file
+    if os.path.exists(SERVICE_ACCOUNT_FILE):
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    raise FileNotFoundError(
+        f"Google credentials not found. Set GOOGLE_SERVICE_ACCOUNT_JSON env var or place file at: {SERVICE_ACCOUNT_FILE}"
     )
-    return build("calendar", "v3", credentials=creds)
 
 
-class SlotBookingRequest(BaseModel):
+# ==========================================
+# DATE & TIME HELPER UTILITIES
+# ==========================================
+def parse_date_flexible(val: str) -> date:
+    """
+    Parses date strings flexibly across multiple formats:
+    - YYYY-MM-DD
+    - YYYY-MM-DDTHH:MM:SS...
+    - DD - MM - YYYY
+    - DD-MM-YYYY
+    - DD/MM/YYYY
+    """
+    if not val:
+        return date.today()
+
+    val_str = str(val).strip()
+
+    # If it contains an ISO timestamp 'T', extract the date segment
+    if "T" in val_str:
+        val_str = val_str.split("T")[0]
+
+    # Clean whitespace around hyphens (e.g. '27 - 09 - 2026' -> '27-09-2026')
+    val_str = re.sub(r"\s*-\s*", "-", val_str)
+
+    patterns = [
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+    ]
+
+    for fmt in patterns:
+        try:
+            return datetime.strptime(val_str, fmt).date()
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unable to parse date '{val}'. Expected format YYYY-MM-DD or DD-MM-YYYY."
+    )
+
+
+def parse_time_flexible(val: str) -> time:
+    """Parses time strings such as '09:00', '9:00', or '09:00:00'."""
+    val_str = str(val).strip()
+    patterns = ["%H:%M", "%H:%M:%S", "%I:%M %p"]
+    for fmt in patterns:
+        try:
+            return datetime.strptime(val_str, fmt).time()
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unable to parse time '{val}'. Expected format HH:MM (e.g. 10:00)."
+    )
+
+
+def generate_clinic_slots(target_date: date) -> List[str]:
+    """Generates all standard working slots for a given day in HH:MM format."""
+    slots = []
+    curr = datetime.combine(target_date, time(CLINIC_OPEN_HOUR, 0))
+    end = datetime.combine(target_date, time(CLINIC_CLOSE_HOUR, 0))
+
+    while curr + timedelta(minutes=SLOT_DURATION_MINUTES) <= end:
+        slots.append(curr.strftime("%H:%M"))
+        curr += timedelta(minutes=SLOT_DURATION_MINUTES)
+
+    return slots
+
+
+# ==========================================
+# PYDANTIC DATA MODELS
+# ==========================================
+class BookingRequest(BaseModel):
     date: str
     time: str
-    patient_name: str
-    patient_phone: str
-    treatment_type: str = "Vstupné vyšetrenie"
+    patient_name: Optional[str] = None
+    patient: Optional[str] = None
+    patient_phone: Optional[str] = None
+    phone: Optional[str] = None
+    treatment_type: Optional[str] = None
+    procedure: Optional[str] = None
+    provider: Optional[str] = "Dr. Novak"
+    fee: Optional[float] = 0.0
+    risk_level: Optional[str] = "Low"
+
+    @property
+    def resolved_patient_name(self) -> str:
+        return (self.patient_name or self.patient or "Valued Patient").strip()
+
+    @property
+    def resolved_phone(self) -> str:
+        return (self.patient_phone or self.phone or "").strip()
+
+    @property
+    def resolved_procedure(self) -> str:
+        return (self.treatment_type or self.procedure or "General Consultation").strip()
 
 
-# -------------------------------------------------------------
-# 3. Model & Health Endpoints
-# -------------------------------------------------------------
+# ==========================================
+# API ENDPOINTS
+# ==========================================
 @app.get("/")
-def home():
-    return {"message": "DentalIQ API is running!"}
+def health_check():
+    return {
+        "status": "online",
+        "service": "DentalIQ Engine",
+        "version": "1.0.0",
+        "auth_mode": "cloud_env" if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") else "local_file"
+    }
 
 
-@app.post("/predict")
-def predict(appointment: dict):
-    if not model:
-        raise HTTPException(status_code=503, detail="Model file dental_model.pkl not loaded.")
-    try:
-        features = pd.DataFrame([{
-            "Age": appointment["age"],
-            "age_group": appointment["age_group"],
-            "lead_time_days": appointment["lead_time_days"],
-            "day_of_week": appointment["day_of_week"],
-            "SMS_received": appointment["sms_received"],
-            "Scholarship": appointment["scholarship"],
-            "Hipertension": appointment["hipertension"],
-            "Diabetes": appointment["diabetes"],
-            "Alcoholism": appointment["alcoholism"],
-            "Handcap": appointment["handcap"]
-        }])
-
-        prob = float(model.predict_proba(features)[0][1])
-
-        if prob >= 0.55:
-            risk = "CRITICAL"
-            action = "Call + WhatsApp + Request Deposit"
-        elif prob >= 0.38:
-            risk = "HIGH"
-            action = "Send WhatsApp Reminder"
-        elif prob >= 0.22:
-            risk = "MODERATE"
-            action = "Send SMS Confirmation"
-        else:
-            risk = "LOW"
-            action = "Monitor Only"
-
-        return {
-            "noshow_probability": round(prob, 2),
-            "risk_tier": risk,
-            "action": action
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# -------------------------------------------------------------
-# 4. Google Calendar Endpoints
-# -------------------------------------------------------------
 @app.get("/api/calendar/events")
-def get_daily_events(date: str = None):
+def list_calendar_events(date: str = Query(..., description="Target date in YYYY-MM-DD or DD-MM-YYYY format")):
     """
-    Fetches scheduled appointments from Google Calendar for the target date (YYYY-MM-DD).
-    Defaults to today if none is provided.
+    Fetches all calendar events for a specific day and formats them
+    for the receptionist dashboard.
     """
+    target_date = parse_date_flexible(date)
+    start_dt = datetime.combine(target_date, time.min).isoformat() + "Z"
+    end_dt = datetime.combine(target_date, time.max).isoformat() + "Z"
+
     try:
         service = get_calendar_service()
-        tz = pytz.timezone(TIMEZONE)
-        target_date_str = date or datetime.now(tz).strftime("%Y-%m-%d")
-
-        day_start = tz.localize(datetime.strptime(f"{target_date_str} 00:00:00", "%Y-%m-%d %H:%M:%S"))
-        day_end = tz.localize(datetime.strptime(f"{target_date_str} 23:59:59", "%Y-%m-%d %H:%M:%S"))
-
         events_result = service.events().list(
-            calendarId=CLINIC_CALENDAR_ID,
-            timeMin=day_start.isoformat(),
-            timeMax=day_end.isoformat(),
+            calendarId=CALENDAR_ID,
+            timeMin=start_dt,
+            timeMax=end_dt,
             singleEvents=True,
             orderBy="startTime"
         ).execute()
 
-        raw_events = events_result.get("items", [])
+        raw_items = events_result.get("items", [])
         formatted_events = []
-        now = datetime.now(tz)
 
-        for item in raw_events:
-            start_iso = item["start"].get("dateTime", item["start"].get("date"))
-            dt = datetime.fromisoformat(start_iso)
-            time_str = dt.strftime("%H:%M")
+        for item in raw_items:
+            start_info = item.get("start", {})
+            start_val = start_info.get("dateTime", start_info.get("date", ""))
+            
+            event_time = "09:00"
+            if "T" in start_val:
+                time_part = start_val.split("T")[1]
+                event_time = time_part[:5]
 
-            summary = item.get("summary", "Zubné vyšetrenie")
-            patient_name = summary
-            proc = "Vstupné vyšetrenie"
-            if ":" in summary:
-                parts = summary.split(":", 1)[1].strip()
-                if "(" in parts and parts.endswith(")"):
-                    patient_name = parts.split("(")[0].strip()
-                    proc = parts.split("(")[1].replace(")", "").strip()
-                else:
-                    patient_name = parts
-
-            # Extract phone number from description if stored
+            summary = item.get("summary", "Dental Appointment")
             description = item.get("description", "")
-            extracted_phone = ""
+
+            # Extract metadata from summary/description
+            patient_name = summary.split(" - ")[0] if " - " in summary else summary
+            procedure = summary.split(" - ")[1] if " - " in summary else "Checkup"
+
+            # Parse phone and fee if stored in description
+            phone = ""
+            fee = 150
             for line in description.split("\n"):
-                if "Telefón:" in line:
-                    extracted_phone = line.replace("Telefón:", "").strip()
+                if "Phone:" in line:
+                    phone = line.replace("Phone:", "").strip()
+                elif "Fee: €" in line:
+                    try:
+                        fee = float(line.replace("Fee: €", "").strip())
+                    except ValueError:
+                        pass
 
             formatted_events.append({
                 "id": item.get("id"),
-                "time": time_str,
+                "time": event_time,
                 "name": patient_name,
-                "proc": proc,
-                "provider": "Dr. Patel",
-                "fee": 150,
+                "patient": patient_name,
+                "proc": procedure,
+                "procedure": procedure,
                 "prob": 0.15,
-                "phone": extracted_phone,
-                "status": "Upcoming" if dt > now else "Completed"
+                "status": "Upcoming",
+                "provider": "Dr. Novak",
+                "fee": fee,
+                "phone": phone
             })
 
+        return {"status": "success", "date": target_date.isoformat(), "events": formatted_events}
+
+    except Exception as e:
+        print("Calendar list error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/calendar/available-slots")
+def get_available_slots(date: str = Query(..., description="Target date in YYYY-MM-DD or DD-MM-YYYY format")):
+    """
+    Returns available 30-minute booking intervals for the selected date.
+    Used by PublicBooking.jsx and the Voice Receptionist Bot.
+    """
+    target_date = parse_date_flexible(date)
+    all_slots = generate_clinic_slots(target_date)
+
+    start_iso = datetime.combine(target_date, time(CLINIC_OPEN_HOUR, 0)).isoformat() + "Z"
+    end_iso = datetime.combine(target_date, time(CLINIC_CLOSE_HOUR, 0)).isoformat() + "Z"
+
+    try:
+        service = get_calendar_service()
+        freebusy_req = {
+            "timeMin": start_iso,
+            "timeMax": end_iso,
+            "timeZone": TIMEZONE,
+            "items": [{"id": CALENDAR_ID}]
+        }
+        freebusy_res = service.freebusy().query(body=freebusy_req).execute()
+        busy_spans = freebusy_res.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
+
+        # Filter out slots that overlap with any busy span
+        open_slots = []
+        for slot_str in all_slots:
+            slot_t = parse_time_flexible(slot_str)
+            slot_start = datetime.combine(target_date, slot_t)
+            slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MINUTES)
+
+            is_busy = False
+            for span in busy_spans:
+                busy_start = datetime.fromisoformat(span["start"].replace("Z", "+00:00")).replace(tzinfo=None)
+                busy_end = datetime.fromisoformat(span["end"].replace("Z", "+00:00")).replace(tzinfo=None)
+
+                # Check if times overlap: max(start1, start2) < min(end1, end2)
+                if max(slot_start, busy_start) < min(slot_end, busy_end):
+                    is_busy = True
+                    break
+
+            if not is_busy:
+                open_slots.append(slot_str)
+
         return {
-            "date": target_date_str,
-            "events": formatted_events
+            "status": "success",
+            "date": target_date.isoformat(),
+            "available_slots": open_slots
         }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=repr(e))
+        print("Available slots error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/calendar/book-or-resolve")
-def book_or_resolve(req: SlotBookingRequest):
+def book_or_resolve_appointment(req: BookingRequest):
+    """
+    Schedules an appointment on Google Calendar.
+    Checks for conflicts; if the slot is occupied, returns status: 'conflict'
+    with alternative available slots.
+    """
+    target_date = parse_date_flexible(req.date)
+    target_time = parse_time_flexible(req.time)
+
+    slot_start = datetime.combine(target_date, target_time)
+    slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MINUTES)
+
+    service = get_calendar_service()
+
+    # 1. Collision check via freebusy query
+    start_iso = slot_start.isoformat() + "Z"
+    end_iso = slot_end.isoformat() + "Z"
+
+    freebusy_req = {
+        "timeMin": start_iso,
+        "timeMax": end_iso,
+        "timeZone": TIMEZONE,
+        "items": [{"id": CALENDAR_ID}]
+    }
+
     try:
-        service = get_calendar_service()
-        tz = pytz.timezone(TIMEZONE)
+        freebusy_res = service.freebusy().query(body=freebusy_req).execute()
+        busy_spans = freebusy_res.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
 
-        start_naive = datetime.strptime(f"{req.date} {req.time}", "%Y-%m-%d %H:%M")
-        start_dt = tz.localize(start_naive)
-        end_dt = start_dt + timedelta(minutes=SLOT_DURATION_MINS)
+        if busy_spans:
+            # Slot is taken: compute 3 nearby open alternatives
+            avail_res = get_available_slots(date=target_date.isoformat())
+            open_slots = avail_res.get("available_slots", [])
+            alternatives = [s for s in open_slots if s != req.time][:3]
 
-        day_start = tz.localize(datetime.strptime(f"{req.date} {CLINIC_OPEN_HOUR:02d}:00", "%Y-%m-%d %H:%M"))
-        day_end = tz.localize(datetime.strptime(f"{req.date} {CLINIC_CLOSE_HOUR:02d}:00", "%Y-%m-%d %H:%M"))
+            return {
+                "status": "conflict",
+                "requested_time": req.time,
+                "suggested_alternatives": alternatives,
+                "message": f"Requested slot {req.time} is already booked."
+            }
 
-        body = {
-            "timeMin": day_start.isoformat(),
-            "timeMax": day_end.isoformat(),
-            "timeZone": TIMEZONE,
-            "items": [{"id": CLINIC_CALENDAR_ID}]
+        # 2. Insert appointment event into Google Calendar
+        event_body = {
+            "summary": f"{req.resolved_patient_name} - {req.resolved_procedure}",
+            "description": (
+                f"DentalIQ Automated Booking\n"
+                f"Patient: {req.resolved_patient_name}\n"
+                f"Phone: {req.resolved_phone}\n"
+                f"Procedure: {req.resolved_procedure}\n"
+                f"Fee: €{req.fee}\n"
+                f"Provider: {req.provider}"
+            ),
+            "start": {
+                "dateTime": slot_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": TIMEZONE
+            },
+            "end": {
+                "dateTime": slot_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timeZone": TIMEZONE
+            }
         }
-        fb_result = service.freebusy().query(body=body).execute()
-        busy_slots = fb_result.get("calendars", {}).get(CLINIC_CALENDAR_ID, {}).get("busy", [])
 
-        # Check for collision
-        for busy in busy_slots:
-            busy_start = datetime.fromisoformat(busy["start"])
-            busy_end = datetime.fromisoformat(busy["end"])
-            if max(start_dt, busy_start) < min(end_dt, busy_end):
-                alternatives = []
-                curr = day_start
-                while curr + timedelta(minutes=SLOT_DURATION_MINS) <= day_end and len(alternatives) < 2:
-                    c_end = curr + timedelta(minutes=SLOT_DURATION_MINS)
-                    is_busy = any(
-                        max(curr, datetime.fromisoformat(b["start"])) < min(c_end, datetime.fromisoformat(b["end"]))
-                        for b in busy_slots
-                    )
-                    c_str = curr.strftime("%H:%M")
-                    if not is_busy and c_str != req.time:
-                        alternatives.append(c_str)
-                    curr += timedelta(minutes=SLOT_DURATION_MINS)
+        created_event = service.events().insert(calendarId=CALENDAR_ID, body=event_body).execute()
 
-                return {
-                    "status": "conflict",
-                    "requested_time": req.time,
-                    "suggested_alternatives": alternatives,
-                    "message": f"Slot {req.time} is already booked."
-                }
-
-        # Slot is available: insert appointment
-        event = {
-            "summary": f"Zubné ošetrenie: {req.patient_name} ({req.treatment_type})",
-            "description": f"Pacient: {req.patient_name}\nTelefón: {req.patient_phone}\nRezervované cez DentalIQ",
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-        }
-        created_event = service.events().insert(calendarId=CLINIC_CALENDAR_ID, body=event).execute()
         return {
-            "status": "booked",
+            "status": "success",
             "event_id": created_event.get("id"),
-            "date": req.date,
-            "time": req.time,
-            "message": f"Appointment successfully confirmed for {req.patient_name}."
+            "html_link": created_event.get("htmlLink"),
+            "message": "Appointment booked successfully in Google Calendar!"
         }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=repr(e))
+        print("Booking creation error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/calendar/events/{event_id}")
-def delete_event(event_id: str):
-    """
-    Deletes an event directly from Google Calendar using its unique event ID.
-    """
+def delete_calendar_event(event_id: str):
+    """Deletes an appointment event directly from Google Calendar."""
     try:
         service = get_calendar_service()
-        service.events().delete(
-            calendarId=CLINIC_CALENDAR_ID,
-            eventId=event_id
-        ).execute()
-
-        return {
-            "status": "deleted",
-            "event_id": event_id,
-            "message": "Appointment successfully removed from Google Calendar."
-        }
+        service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        return {"status": "success", "deleted_id": event_id, "message": "Event deleted from Google Calendar"}
+    except HttpError as e:
+        if e.resp.status == 404:
+            raise HTTPException(status_code=404, detail="Event not found in Google Calendar")
+        raise HTTPException(status_code=e.resp.status, detail=str(e))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=repr(e))
+        print("Event deletion error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,7 +1,12 @@
 fastapi
 uvicorn
+pydantic
 scikit-learn
 pandas
 joblib
 xgboost
 numpy
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
