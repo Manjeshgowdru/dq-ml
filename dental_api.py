@@ -4,6 +4,14 @@ import re
 from datetime import datetime, date, time, timedelta
 from typing import Optional, List
 
+# Local development: read secrets (GEMINI_API_KEY, GOOGLE_CALENDAR_ID, ...) from .env next to this file.
+# On Render these come from the service's Environment settings instead.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -12,6 +20,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+import clinic_data
+from clinic_api import router as clinic_router
+from voice_api import router as voice_router
+
 # ==========================================
 # CONFIGURATION & CONSTANTS
 # ==========================================
@@ -19,6 +31,21 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "service_account.json")
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 TIMEZONE = os.environ.get("CLINIC_TIMEZONE", "Europe/Bratislava")
+
+def clinic_tz():
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(TIMEZONE)
+
+
+def local_rfc3339(naive_local: datetime) -> str:
+    """Clinic wall-clock time -> RFC 3339 with the clinic's real UTC offset (e.g. +02:00 in summer)."""
+    return naive_local.replace(tzinfo=clinic_tz()).isoformat()
+
+
+def to_clinic_local(rfc3339: str) -> datetime:
+    """Any RFC 3339 time from Google -> naive clinic wall-clock time."""
+    return datetime.fromisoformat(rfc3339.replace("Z", "+00:00")).astimezone(clinic_tz()).replace(tzinfo=None)
+
 
 CLINIC_OPEN_HOUR = 8       # 08:00
 CLINIC_CLOSE_HOUR = 17     # 17:00
@@ -38,6 +65,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Clinic modules (patients, predictions, financials, stock, procurement, equipment, plans, billing, labs, reports, settings)
+app.include_router(clinic_router)
+# AI voice receptionist (Gemini Live tokens, phone-verified find/cancel)
+app.include_router(voice_router)
+
+
+@app.on_event("startup")
+def warm_up_clinic_data():
+    """Build the clinic data and load the ML model at startup so the first page load is fast."""
+    clinic_data.ensure_data()
 
 
 # ==========================================
@@ -132,16 +170,8 @@ def parse_time_flexible(val: str) -> time:
 
 
 def generate_clinic_slots(target_date: date) -> List[str]:
-    """Generates all standard working slots for a given day in HH:MM format."""
-    slots = []
-    curr = datetime.combine(target_date, time(CLINIC_OPEN_HOUR, 0))
-    end = datetime.combine(target_date, time(CLINIC_CLOSE_HOUR, 0))
-
-    while curr + timedelta(minutes=SLOT_DURATION_MINUTES) <= end:
-        slots.append(curr.strftime("%H:%M"))
-        curr += timedelta(minutes=SLOT_DURATION_MINUTES)
-
-    return slots
+    """Generates all working slots for a given day in HH:MM format, following the opening hours in Settings."""
+    return clinic_data.day_slots(target_date)
 
 
 # ==========================================
@@ -166,7 +196,8 @@ class BookingRequest(BaseModel):
 
     @property
     def resolved_phone(self) -> str:
-        return (self.patient_phone or self.phone or "").strip()
+        raw = (self.patient_phone or self.phone or "").strip()
+        return clinic_data.normalize_phone(raw) or raw
 
     @property
     def resolved_procedure(self) -> str:
@@ -193,8 +224,8 @@ def list_calendar_events(date: str = Query(..., description="Target date in YYYY
     for the receptionist dashboard.
     """
     target_date = parse_date_flexible(date)
-    start_dt = datetime.combine(target_date, time.min).isoformat() + "Z"
-    end_dt = datetime.combine(target_date, time.max).isoformat() + "Z"
+    start_dt = local_rfc3339(datetime.combine(target_date, time.min))
+    end_dt = local_rfc3339(datetime.combine(target_date, time(23, 59, 59)))
 
     try:
         service = get_calendar_service()
@@ -267,8 +298,10 @@ def get_available_slots(date: str = Query(..., description="Target date in YYYY-
     target_date = parse_date_flexible(date)
     all_slots = generate_clinic_slots(target_date)
 
-    start_iso = datetime.combine(target_date, time(CLINIC_OPEN_HOUR, 0)).isoformat() + "Z"
-    end_iso = datetime.combine(target_date, time(CLINIC_CLOSE_HOUR, 0)).isoformat() + "Z"
+    if not all_slots:
+        return {"status": "success", "date": target_date.isoformat(), "available_slots": []}
+    start_iso = local_rfc3339(datetime.combine(target_date, time.min))
+    end_iso = local_rfc3339(datetime.combine(target_date, time(23, 59, 59)))
 
     try:
         service = get_calendar_service()
@@ -290,8 +323,8 @@ def get_available_slots(date: str = Query(..., description="Target date in YYYY-
 
             is_busy = False
             for span in busy_spans:
-                busy_start = datetime.fromisoformat(span["start"].replace("Z", "+00:00")).replace(tzinfo=None)
-                busy_end = datetime.fromisoformat(span["end"].replace("Z", "+00:00")).replace(tzinfo=None)
+                busy_start = to_clinic_local(span["start"])
+                busy_end = to_clinic_local(span["end"])
 
                 # Check if times overlap: max(start1, start2) < min(end1, end2)
                 if max(slot_start, busy_start) < min(slot_end, busy_end):
@@ -325,11 +358,20 @@ def book_or_resolve_appointment(req: BookingRequest):
     slot_start = datetime.combine(target_date, target_time)
     slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MINUTES)
 
+    # Booking rules enforced on the server (website, staff and voice receptionist alike)
+    open_slots = generate_clinic_slots(target_date)
+    if not open_slots:
+        raise HTTPException(status_code=400, detail="The clinic is closed on that day. Please choose another date.")
+    if slot_start.strftime("%H:%M") not in open_slots:
+        raise HTTPException(status_code=400, detail=f"{target_time.strftime('%H:%M')} is not a bookable time. Bookable times are {open_slots[0]}–{open_slots[-1]} on the half hour.")
+    if slot_start <= clinic_data.clinic_now():
+        raise HTTPException(status_code=400, detail="That time has already passed. Please choose a later time.")
+
     service = get_calendar_service()
 
     # 1. Collision check via freebusy query
-    start_iso = slot_start.isoformat() + "Z"
-    end_iso = slot_end.isoformat() + "Z"
+    start_iso = local_rfc3339(slot_start)
+    end_iso = local_rfc3339(slot_end)
 
     freebusy_req = {
         "timeMin": start_iso,

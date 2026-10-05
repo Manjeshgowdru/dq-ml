@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "algorithm": "XGBoost (unweighted, calibrated probabilities)",
+  "trained_at": "2026-10-05T17:52:02+00:00",
+  "training_rows": 110521,
+  "dataset": "KaggleV2-May-2016 (public medical appointment no-shows)",
+  "features": [
+    "age",
+    "lead_days",
+    "same_day",
+    "day_of_week",
+    "booked_hour",
+    "male",
+    "sms_reminder",
+    "hypertension",
+    "diabetes",
+    "alcoholism",
+    "handicap",
+    "prev_appts",
+    "prev_noshows",
+    "prev_noshow_rate"
+  ],
+  "metrics": {
+    "roc_auc": 0.7382,
+    "roc_auc_advance_bookings": 0.6117,
+    "pr_auc": 0.3598,
+    "brier": 0.1347,
+    "mean_predicted": 0.2032,
+    "actual_noshow_rate": 0.1846,
+    "validation": "time split: train < 2016-06-01 (84071 rows), test >= 2016-06-01 (26450 rows)"
+  }
+}
